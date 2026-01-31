@@ -1,4 +1,4 @@
- const express = require("express");
+const express = require("express");
 const connectDB = require("./db");
 const User = require("./models/User");
 const bcrypt = require("bcryptjs");
@@ -12,7 +12,7 @@ app.use(express.json());
 connectDB();
 
 // ---------------- AUTH MIDDLEWARE ----------------
-const authmiddleware = (req, res, next) => {
+const authmiddleware = async (req, res, next) => {
   const authHeader = req.headers.authorization;
 
   if (!authHeader) {
@@ -26,8 +26,24 @@ const authmiddleware = (req, res, next) => {
   }
 
   try {
+    // 1️⃣ Verify JWT
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded; // { id, email }
+
+    // 2️⃣ Check token + login status in DB
+    const user = await User.findOne({
+      _id: decoded.id,
+      "tokens.token": token,
+      isLoggedIn: true,
+    });
+
+    if (!user) {
+      return res.status(401).json({ message: "Session expired" });
+    }
+
+    // 3️⃣ Attach user & token
+    req.user = user;
+    req.token = token;
+
     next();
   } catch (error) {
     return res.status(401).json({ message: "Invalid or expired token" });
@@ -37,10 +53,6 @@ const authmiddleware = (req, res, next) => {
 // ---------------- BASIC ROUTES ----------------
 app.get("/", (req, res) => {
   res.send("Hello from backend");
-});
-
-app.get("/about", (req, res) => {
-  res.send("About page");
 });
 
 // ---------------- REGISTER ----------------
@@ -88,17 +100,18 @@ app.post("/login", async (req, res) => {
     const token = jwt.sign(
       { id: user._id, email: user.email },
       process.env.JWT_SECRET,
-      { expiresIn: "1d" }
+      { expiresIn: "1d" },
     );
+
+    // 🔥 SAVE TOKEN + LOGIN STATUS
+    user.tokens.push({ token });
+    user.isLoggedIn = true;
+    await user.save();
 
     res.json({
       message: "Login successful",
       token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-      },
+      isLoggedIn: user.isLoggedIn,
     });
   } catch (error) {
     console.log("Login error:", error);
@@ -106,73 +119,84 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// ---------------- GET CURRENT LOGGED-IN USER (/me) ----------------
+// ---------------- CURRENT USER (/me) ----------------
 app.get("/me", authmiddleware, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.id).select("-password");
-
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    res.json({
-      message: "Current logged-in user",
-      user,
-    });
-  } catch (error) {
-    console.log("Me API error:", error);
-    res.status(500).json({ message: "Server error" });
-  }
+  res.json({
+    message: "Current logged-in user",
+    user: {
+      id: req.user._id,
+      name: req.user.name,
+      email: req.user.email,
+    },
+  });
 });
 
 // ---------------- GET ALL USERS ----------------
 app.get("/users", authmiddleware, async (req, res) => {
-  try {
-    const users = await User.find().select("-password");
-    res.json({
-      message: "Users fetched successfully",
-      users,
-    });
-  } catch (error) {
-    console.log("Fetch error:", error);
-    res.status(500).json({ message: "Server error" });
-  }
+  const users = await User.find().select("-password -tokens");
+  res.json(users);
 });
-
 // ---------------- GET USER BY ID ----------------
 app.get("/users/:id", authmiddleware, async (req, res) => {
   try {
-    const user = await User.findById(req.params.id).select("-password");
+    const user = await User.findById(req.params.id).select("-password -tokens");
 
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
 
     res.json({
-      message: "User fetched by id",
+      message: "User fetched successfully",
       user,
     });
   } catch (error) {
-    console.log("Get by id error:", error);
+    console.log("Get user by id error:", error);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// ---------------- UPDATE USER ----------------
+// ---------------- LOGOUT ----------------
+app.post("/logout", authmiddleware, async (req, res) => {
+  // 🔥 remove current token
+  req.user.tokens = req.user.tokens.filter((t) => t.token !== req.token);
+
+  if (req.user.tokens.length === 0) {
+    req.user.isLoggedIn = false;
+  }
+
+  await req.user.save();
+
+  res.json({ message: "Logged out successfully" });
+});
+ 
 app.put("/users/:id", authmiddleware, async (req, res) => {
   try {
-    const updatedUser = await User.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true }
-    ).select("-password");
+    const { name, email, password } = req.body;
 
-    if (!updatedUser) {
-      return res.status(404).json({ message: "User not found" });
+    // 🔒 Only logged-in user can update his own data
+    if (req.user._id.toString() !== req.params.id) {
+      return res.status(403).json({ message: "Access denied" });
     }
 
+    const updateData = {};
+
+    if (name) updateData.name = name;
+    if (email) updateData.email = email;
+
+    // 🔐 Password update (optional)
+    if (password) {
+      const salt = await bcrypt.genSalt(10);
+      updateData.password = await bcrypt.hash(password, salt);
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(
+      req.params.id,
+      updateData,
+      { new: true }
+    ).select("-password -tokens");
+
     res.json({
-      message: "User updated successfully",
+      message: "Profile updated successfully",
       user: updatedUser,
     });
   } catch (error) {
@@ -181,18 +205,19 @@ app.put("/users/:id", authmiddleware, async (req, res) => {
   }
 });
 
+
 // ---------------- DELETE USER ----------------
 app.delete("/users/:id", authmiddleware, async (req, res) => {
   try {
-    const deletedUser = await User.findByIdAndDelete(req.params.id);
-
-    if (!deletedUser) {
-      return res.status(404).json({ message: "User not found" });
+    // 🔒 Only logged-in user can delete his own account
+    if (req.user._id.toString() !== req.params.id) {
+      return res.status(403).json({ message: "Access denied" });
     }
 
+    await User.findByIdAndDelete(req.params.id);
+
     res.json({
-      message: "User deleted successfully",
-      user: deletedUser,
+      message: "User account deleted successfully",
     });
   } catch (error) {
     console.log("Delete error:", error);
